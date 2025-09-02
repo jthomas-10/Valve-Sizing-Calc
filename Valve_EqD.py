@@ -1,7 +1,7 @@
 import streamlit as st
 import numpy as np
 import pandas as pd
-from CoolProp.CoolProp import PropsSI
+from CoolProp.CoolProp import PropsSI, PhaseSI
 import math
 import matplotlib.pyplot as plt
 import plotly.express as px
@@ -187,17 +187,15 @@ with st.sidebar:
         # Get default values from valve type
         default_xt = AEROSPACE_VALVE_TYPES[valve_type]["xt_default"]
         default_geo_factor = AEROSPACE_VALVE_TYPES[valve_type]["geo_factor"]
-        
+
         # Allow adjusting critical pressure ratio with detailed explanation
         st.markdown("""
-        **Critical Pressure Ratio (xT)** is the ratio of pressure drop to inlet pressure 
-        at which flow becomes choked. Values from aerospace standards:
-        - Sharp-edged orifice: 0.528 (ideal gas theory)
-        - Globe valves: 0.67-0.73 (ISA-75.01.01)
-        - Ball valves: 0.70-0.75 (NASA-TM-X-52097)
-        - Relief valves: 0.65-0.70 (ASME Section VIII)
+        - xT is the critical drop ratio, defined as ΔP/P₁ at which flow chokes.
+        - The complementary metric is the critical downstream ratio P₂/P₁|crit = 1 − xT.
+        - Ideal-gas reference: P₂/P₁|crit = (2/(k+1))^(k/(k−1)). For k ≈ 1.4 → P₂/P₁|crit ≈ 0.528, so xT ≈ 0.472.
+        - Use vendor datasheet xT when available; defaults here are a starting point and may vary by design.
         """)
-        
+
         # The theoretical value will be updated after fluid properties are calculated
         custom_xt = st.slider(
             "Critical Pressure Ratio (xT)", 
@@ -305,7 +303,7 @@ with main_tabs[0]:
         # Add pressure type selection (gauge or absolute)
         pressure_type = st.radio("Pressure type", ["Absolute", "Gauge"], horizontal=True)
         
-        # Convert pressure value to Pa (moved here from below)
+        # Convert pressure value to Pa (absolute) and keep as single source of truth P1_Pa
         P_Pa = P_val * (1e3 if P_unit=="kPa" else 6894.76 if P_unit=="psia" else 1e5 if P_unit=="bar" else 1e6)
         
         # Apply gauge pressure correction if needed
@@ -313,6 +311,8 @@ with main_tabs[0]:
             # Add atmospheric pressure to gauge pressure to get absolute
             atm_pressure = 101325.0  # Standard atmospheric pressure in Pa
             P_Pa += atm_pressure
+        # Absolute inlet pressure (upstream) — single source of truth
+        P1_Pa = P_Pa
             
         st.markdown('</div>', unsafe_allow_html=True)
     
@@ -332,28 +332,43 @@ with main_tabs[0]:
         use_range = st.checkbox("Use flow rate range", value=True)
         
         if use_range:
-            max_range = 10.0 if fr_unit in ["kg/s", "lbm/s"] else 100.0 if fr_unit in ["g/s"] else 0.01 if fr_unit in ["m³/s", "ft³/s"] else 10.0
-            fr_min, fr_max = st.slider(f"Flow rate ({unit_label})", 
-                                       0.0, max_range, 
-                                       (max_range*0.1, max_range*0.2),
-                                       step=max_range/100)
+            # Use explicit min/max inputs instead of a slider
+            default_max = 10.0 if fr_unit in ["kg/s", "lbm/s"] else 100.0 if fr_unit in ["g/s"] else 0.01 if fr_unit in ["m³/s", "ft³/s"] else 10.0
+            col_min, col_max = st.columns(2)
+            with col_min:
+                fr_min = st.number_input(f"Flow rate min ({unit_label})", value=default_max*0.1, step=default_max/100, min_value=0.0)
+            with col_max:
+                fr_max = st.number_input(f"Flow rate max ({unit_label})", value=default_max*0.2, step=default_max/100, min_value=0.0)
+            if fr_max < fr_min:
+                st.warning("Flow rate max is less than min. Adjusting to match min.")
+                fr_max = fr_min
+            if fr_max == fr_min:
+                # nudge max by one step to create a valid range for sampling
+                fr_max = fr_min + max(default_max/100, 1e-6)
         else:
             max_val = 10.0 if fr_unit in ["kg/s", "lbm/s"] else 100.0 if fr_unit in ["g/s"] else 0.01 if fr_unit in ["m³/s", "ft³/s"] else 10.0
             fr_min = fr_max = st.number_input(f"Flow rate ({unit_label})", value=max_val*0.1, step=max_val/100)
-        
-        dp_unit = st.selectbox("ΔP unit", ["kPa", "psi (absolute)", "bar"])
-        
+
+        dp_unit = st.selectbox("ΔP unit", ["kPa", "psi", "bar"])
+
         use_dp_range = st.checkbox("Use ΔP range", value=False)
         
         if use_dp_range:
-            max_dp = 500.0 if dp_unit == "kPa" else 72.5 if dp_unit == "psi (absolute)" else 5.0
-            dp_min, dp_max = st.slider(f"ΔP allowable ({dp_unit})", 
-                                      0.0, max_dp, 
-                                      (max_dp*0.1, max_dp*0.1),
-                                      step=max_dp/100)
+            # Use explicit min/max inputs for ΔP
+            default_dp_max = 500.0 if dp_unit == "kPa" else 72.5 if dp_unit == "psi" else 5.0
+            col_dp_min, col_dp_max = st.columns(2)
+            with col_dp_min:
+                dp_min = st.number_input(f"ΔP min ({dp_unit})", value=default_dp_max*0.1, step=default_dp_max/100, min_value=0.0)
+            with col_dp_max:
+                dp_max = st.number_input(f"ΔP max ({dp_unit})", value=default_dp_max*0.1, step=default_dp_max/100, min_value=0.0)
+            if dp_max < dp_min:
+                st.warning("ΔP max is less than min. Adjusting to match min.")
+                dp_max = dp_min
+            if dp_max == dp_min:
+                dp_max = dp_min + max(default_dp_max/100, 1e-6)
         else:
-            max_dp = 500.0 if dp_unit == "kPa" else 72.5 if dp_unit == "psi (absolute)" else 5.0
-            dp_min = dp_max = st.number_input(f"ΔP allowable ({dp_unit})", value=max_dp*0.1, step=max_dp/100)
+            default_dp_max = 500.0 if dp_unit == "kPa" else 72.5 if dp_unit == "psi" else 5.0
+            dp_min = dp_max = st.number_input(f"ΔP allowable ({dp_unit})", value=default_dp_max*0.1, step=default_dp_max/100)
         
         st.markdown('</div>', unsafe_allow_html=True)
 
@@ -369,7 +384,7 @@ with main_tabs[0]:
             materials = AEROSPACE_VALVE_TYPES[valve_type]["materials"][fluid_selection]
             
             # N-5: Flag hazardous material combinations
-            is_high_pressure = P_Pa > 5e6  # 5 MPa / ~725 psi threshold
+            is_high_pressure = P1_Pa > 5e6  # 5 MPa / ~725 psi threshold
             
             for material in materials:
                 material_line = f"- {material}"
@@ -417,7 +432,7 @@ stat_df = None
 df = pd.DataFrame() # Initialize df globally
 
 # 2) Units conversion to SI
-P_Pa = P_val * (1e3 if P_unit=="kPa" else 6894.76 if P_unit=="psia" else 1e5 if P_unit=="bar" else 1e6)
+# NOTE: P1_Pa already computed above as absolute upstream pressure. Do not overwrite it here.
 
 # Convert flow rate to SI
 if fr_type == "Mass Flow":
@@ -428,53 +443,64 @@ else:
     flow_convert = 1.0 if fr_unit == "m³/s" else 0.02831685 if fr_unit == "ft³/s" else 0.001 if fr_unit == "L/s" else 0.0000631 # gpm
 
 # Convert ΔP to Pa
-dp_convert = 1e3 if dp_unit == "kPa" else 6894.76 if dp_unit == "psi (absolute)" else 1e5 # bar
+dp_convert = 1e3 if dp_unit == "kPa" else 6894.76 if dp_unit == "psi" else 1e5 # bar
 
 # 3) Get fluid properties using CoolProp
 try:
-    with st.spinner(f"Calculating properties for {fluid} at {T:.2f} K and {P_Pa/1e3:.2f} kPa..."):
+    with st.spinner(f"Calculating properties for {fluid} at {T:.2f} K and {P1_Pa/1e3:.2f} kPa..."):
+        # Robust two-phase check before property calls
         try:
-            # M-6: Handle two-phase region risk with specific try/except
-            rho = PropsSI("D", "T", T, "P", P_Pa, fluid)  # Density (kg/m³)
-            mu = PropsSI("V", "T", T, "P", P_Pa, fluid)   # Dynamic viscosity (Pa·s)
+            phase_str = PhaseSI("T", T, "P", P1_Pa, fluid)
+            _phase_flag = str(phase_str).lower().replace("-", "").replace(" ", "")
+            if "twophase" in _phase_flag:
+                st.error("❌ Two-phase fluid state detected. This calculator does not support two-phase flow. Please adjust temperature or pressure to ensure single-phase conditions.")
+                st.stop()
+        except Exception:
+            # Fallback: try quality when available
+            try:
+                q = PropsSI("Q", "T", T, "P", P1_Pa, fluid)
+                if 0.0 < q < 1.0:
+                    st.error("❌ Two-phase fluid state detected. Please adjust to single-phase conditions.")
+                    st.stop()
+            except Exception:
+                pass
+
+        try:
+            # Properties at upstream absolute pressure
+            rho = PropsSI("D", "T", T, "P", P1_Pa, fluid)  # Density (kg/m³)
+            mu = PropsSI("V", "T", T, "P", P1_Pa, fluid)   # Dynamic viscosity (Pa·s)
             
-            # Calculate specific heat ratio directly - more accurate than previous method
-            cp = PropsSI("CPMASS", "T", T, "P", P_Pa, fluid)  # Specific heat capacity (J/kg/K)
-            cv = PropsSI("CVMASS", "T", T, "P", P_Pa, fluid)  # Specific heat capacity (J/kg/K)
+            # Calculate specific heat ratio directly
+            cp = PropsSI("CPMASS", "T", T, "P", P1_Pa, fluid)  # J/kg/K
+            cv = PropsSI("CVMASS", "T", T, "P", P1_Pa, fluid)  # J/kg/K
             k = cp/cv  # Specific heat ratio
             
-            # Add compressibility factor for all flow models
-            Z = PropsSI("Z", "T", T, "P", P_Pa, fluid)  # Compressibility factor
-            
-            # Define R_specific for all flow models
+            # Compressibility factor and gas constant
+            Z = PropsSI("Z", "T", T, "P", P1_Pa, fluid)
             R_universal = 8.314462618  # J/mol/K
-            M_molar = PropsSI("MOLAR_MASS", "T", T, "P", P_Pa, fluid)
+            M_molar = PropsSI("MOLAR_MASS", "T", T, "P", P1_Pa, fluid)
             R_specific = R_universal / M_molar
             
-            # Calculate theoretical critical pressure ratio for the specific gas
-            x_t_ideal = (2/(k+1))**(k/(k-1))
+            # Critical ratios (ideal gas reference)
+            p2_p1_crit = (2.0/(k+1.0))**(k/(k-1.0))      # critical P2/P1
+            x_t_ideal = 1.0 - p2_p1_crit                 # critical ΔP/P1
             
-            # Update the info text in the sidebar with the calculated x_t_ideal
+            # Sidebar info
             with st.sidebar:
                 with st.expander("Critical Flow Information", expanded=False):
-                    st.info(f"Theoretical ideal gas xT for {fluid} (k={k:.3f}): {x_t_ideal:.3f}")
-                    st.write(f"Selected xT: {custom_xt:.3f}")
+                    st.info(f"Ideal critical ratios for {fluid} (k={k:.3f}): P2/P1|crit = {p2_p1_crit:.3f},  xT = ΔP/P1|crit = {x_t_ideal:.3f}")
+                    st.write(f"Selected xT (ΔP/P1): {custom_xt:.3f}")
                     if custom_xt < x_t_ideal * 0.95:
-                        st.warning(f"Selected xT ({custom_xt:.3f}) is significantly lower than theoretical value ({x_t_ideal:.3f}). Flow may choke before predicted.")
+                        st.warning(f"Selected xT ({custom_xt:.3f}) is significantly lower than ideal ({x_t_ideal:.3f}). Flow may choke before predicted.")
                     elif custom_xt > x_t_ideal * 1.2:
-                        st.warning(f"Selected xT ({custom_xt:.3f}) is significantly higher than theoretical value ({x_t_ideal:.3f}). Critical flow might not be predicted correctly.")
-            
-            # Additional check for phase (liquid, gas, supercritical)
-            phase = PropsSI("PHASE", "T", T, "P", P_Pa, fluid)
-            if phase == 2:  # Two-phase region
-                st.warning(f"⚠️ Warning: The specified conditions for {fluid} lie in the two-phase region where fluid properties can be unpredictable.")
-                
+                        st.warning(f"Selected xT ({custom_xt:.3f}) is significantly higher than ideal ({x_t_ideal:.3f}). Critical flow might not be predicted correctly.")
         except ValueError as e:
-            if "two-phase" in str(e).lower() or "saturated" in str(e).lower():
+            _err = str(e).lower()
+            if ("two-phase" in _err or "twophase" in _err or ("two" in _err and "phase" in _err)) or "saturated" in _err:
                 st.error("❌ Two-phase fluid state detected. This calculator does not support two-phase flow. Please adjust temperature or pressure to ensure single-phase conditions.")
                 st.stop()
             else:
-                raise e  # Re-raise if it's a different ValueError
+                raise e
 except Exception as e:
     st.error(f"Error calculating fluid properties: {str(e)}")
     st.stop()
@@ -487,6 +513,14 @@ if fr_min != fr_max or dp_min != dp_max:
     with st.spinner(f"Running Monte Carlo with {n_samples} samples..."):
         # N-2: Add correlation between flow rate and pressure drop
         correlation_option = st.checkbox("Use correlated sampling (flow ↑ → ΔP ↑)", value=False)
+        scipy_ok = True
+        try:
+            from scipy.stats import norm  # noqa: F401
+        except Exception:
+            scipy_ok = False
+            if correlation_option:
+                st.warning("Correlated sampling requested but SciPy is unavailable. Falling back to uncorrelated sampling.")
+                correlation_option = False
         
         if correlation_option and fr_min != fr_max and dp_min != dp_max:
             # Generate correlated samples using bivariate normal distribution
@@ -499,7 +533,6 @@ if fr_min != fr_max or dp_min != dp_max:
             z1, z2 = np.random.multivariate_normal(mean, cov, n_samples).T
             
             # Transform to uniform using the normal CDF
-            from scipy.stats import norm
             u1 = norm.cdf(z1)
             u2 = norm.cdf(z2)
             
@@ -512,9 +545,9 @@ if fr_min != fr_max or dp_min != dp_max:
             dp_samples = dp_samples * dp_convert
             
             # Check for excessive pressure drops and clip to prevent negative P2
-            dp_samples = np.minimum(dp_samples, 0.98 * P_Pa)  # Clip at 98% of P1 to prevent negative P2
+            dp_samples = np.minimum(dp_samples, 0.98 * P1_Pa)  # Clip at 98% of P1 to prevent negative P2
             # Check if any samples were clipped
-            if np.any(dp_samples >= 0.98 * P_Pa):
+            if np.any(dp_samples >= 0.98 * P1_Pa):
                 st.warning("⚠️ Some pressure drop samples exceeded inlet pressure and were clipped to prevent negative downstream pressure.")
         else:
             # Original uncorrelated sampling
@@ -522,16 +555,16 @@ if fr_min != fr_max or dp_min != dp_max:
             dp_samples = np.random.uniform(dp_min, dp_max, n_samples) * dp_convert
             
             # Check for excessive pressure drops and clip to prevent negative P2
-            dp_samples = np.minimum(dp_samples, 0.98 * P_Pa)
-            if np.any(dp_samples >= 0.98 * P_Pa):
+            dp_samples = np.minimum(dp_samples, 0.98 * P1_Pa)
+            if np.any(dp_samples >= 0.98 * P1_Pa):
                 st.warning("⚠️ Some pressure drop samples exceeded inlet pressure and were clipped to prevent negative downstream pressure.")
 else:
     fr_samples = np.array([fr_min * flow_convert])
     dp_samples = np.array([dp_min * dp_convert])
     
     # Check single sample too
-    if dp_samples[0] >= P_Pa:
-        dp_samples[0] = 0.98 * P_Pa
+    if dp_samples[0] >= P1_Pa:
+        dp_samples[0] = 0.98 * P1_Pa
         st.warning("⚠️ Pressure drop exceeds inlet pressure and was clipped to prevent negative downstream pressure.")
 
 # 5) Calculate EqA & EqD based on selected flow model
@@ -569,8 +602,8 @@ if flow_model == "Incompressible":
             Cd_corrected[i] = Cd
             continue
             
-        # Calculate pressure ratio and check for critical flow condition
-        x = dp_samples[i] / P_Pa
+    # Calculate pressure ratio and check for critical flow condition
+        x = dp_samples[i] / P1_Pa
         
         # Auto-switch to critical flow if pressure ratio exceeds critical
         if x >= x_t:
@@ -579,18 +612,17 @@ if flow_model == "Incompressible":
             Cd_corrected[i] = Cd  # Start with nominal Cd
             
             # Critical flow calculation (same as critical flow branch)
-            eqA[i] = calculate_choked_flow(fr_samples[i], P_Pa, Cd_corrected[i])
-            critical_flow_transitions += 1  # Increment critical flow transition count
+            eqA[i] = calculate_choked_flow(fr_samples[i], P1_Pa, Cd_corrected[i])
             continue
             
         # For each pressure sample, calculate upstream and downstream densities
-        P2_Pa = P_Pa - dp_samples[i]
+        P2_Pa = P1_Pa - dp_samples[i]
         try:
-            rho_upstream = PropsSI("D", "T", T, "P", P_Pa, fluid)
+            rho_upstream = PropsSI("D", "T", T, "P", P1_Pa, fluid)
             rho_downstream = PropsSI("D", "T", T, "P", P2_Pa, fluid)
             # Use average density for incompressible flow
             rho_avg = (rho_upstream + rho_downstream) / 2
-            mu_sample = PropsSI("V", "T", T, "P", P_Pa, fluid)  # Use upstream viscosity
+            mu_sample = PropsSI("V", "T", T, "P", P1_Pa, fluid)  # Use upstream viscosity
         except Exception:
             # Fallback to original density if CoolProp fails
             rho_avg = rho
@@ -656,12 +688,12 @@ elif flow_model == "Compressible - Subsonic":
     # Using ISA-75.01.01 equations for control valves
     Y_values = np.zeros_like(fr_samples)
     
-    # Theoretical critical pressure ratio (ideal gas)
-    x_t_ideal = (2/(k+1))**(k/(k-1))
+    # Theoretical critical pressure ratio (ideal gas) (display/reference only)
+    # Note: critical ratios are computed earlier for display; no need to recompute here
     
     for i in range(len(fr_samples)):
         # Guard against division by zero and extreme values
-        if dp_samples[i] <= 0 or fr_samples[i] <= 0 or P_Pa <= 0 or rho <= 0:
+        if dp_samples[i] <= 0 or fr_samples[i] <= 0 or P1_Pa <= 0 or rho <= 0:
             eqA[i] = 0
             Re[i] = 0
             Cd_corrected[i] = Cd
@@ -669,13 +701,13 @@ elif flow_model == "Compressible - Subsonic":
             continue
             
         # Calculate pressure ratio x and downstream pressure
-        x = dp_samples[i] / P_Pa
-        P2_Pa = P_Pa - dp_samples[i]
+        x = dp_samples[i] / P1_Pa
+        P2_Pa = P1_Pa - dp_samples[i]
         
         # Calculate upstream density and viscosity for this specific pressure point
         try:
-            rho_upstream = PropsSI("D", "T", T, "P", P_Pa, fluid)
-            mu_upstream = PropsSI("V", "T", T, "P", P_Pa, fluid)
+            rho_upstream = PropsSI("D", "T", T, "P", P1_Pa, fluid)
+            mu_upstream = PropsSI("V", "T", T, "P", P1_Pa, fluid)
         except Exception:
             # Fallback to original values if CoolProp fails
             rho_upstream = rho
@@ -692,7 +724,7 @@ elif flow_model == "Compressible - Subsonic":
             sonic_velocity = np.sqrt(k * Z * R_specific * T)
             
             # Estimate area first for Reynolds calculation
-            eqA_approx = calculate_choked_flow(fr_samples[i], P_Pa, Cd)
+            eqA_approx = calculate_choked_flow(fr_samples[i], P1_Pa, Cd)
             eqD_approx = np.sqrt(4 * eqA_approx / math.pi) if eqA_approx > 0 else 0
             
             Re[i] = rho_upstream * sonic_velocity * eqD_approx / mu_upstream if mu_upstream > 0 and eqD_approx > 0 else 0
@@ -706,15 +738,14 @@ elif flow_model == "Compressible - Subsonic":
                 Cd_corrected[i] = Cd
                 
             # Final critical flow calculation with corrected Cd
-            eqA[i] = calculate_choked_flow(fr_samples[i], P_Pa, Cd_corrected[i])
+            eqA[i] = calculate_choked_flow(fr_samples[i], P1_Pa, Cd_corrected[i])
             Y_values[i] = 0.0  # Y factor not applicable for choked flow
-            critical_flow_transitions += 1  # Increment critical flow transition count
             continue
             
         # For subsonic compressible flow
         # Calculate Y-factor with proper pressure ratio term
         if P2_Pa > 0:  # Prevent division by zero
-            pressure_ratio_term = (P2_Pa/P_Pa)**((k-1)/k)
+            pressure_ratio_term = (P2_Pa/P1_Pa)**((k-1)/k)
             # Standard Y-factor formula from ISA-75.01.01-2012
             Y = 1.0 - (x/(3*geometry_factor*x_t)) * (1.0 - pressure_ratio_term)
             Y_values[i] = max(0.1, min(1.0, Y))  # Bound between 0.1 and 1.0 for stability
@@ -752,23 +783,23 @@ elif flow_model == "Compressible - Critical Flow":
     # For critical/choked flow conditions
     for i in range(len(fr_samples)):
         # Guard against division by zero or invalid inputs
-        if P_Pa <= 0 or fr_samples[i] <= 0 or Z <= 0 or T <= 0:
+        if P1_Pa <= 0 or fr_samples[i] <= 0 or Z <= 0 or T <= 0:
             eqA[i] = 0
             Re[i] = 0
             Cd_corrected[i] = Cd
             continue
-            
+        
         # Calculate per-sample fluid properties
         try:
-            rho_upstream = PropsSI("D", "T", T, "P", P_Pa, fluid)
-            mu_upstream = PropsSI("V", "T", T, "P", P_Pa, fluid)
+            rho_upstream = PropsSI("D", "T", T, "P", P1_Pa, fluid)
+            mu_upstream = PropsSI("V", "T", T, "P", P1_Pa, fluid)
         except Exception:
             # Fallback to original values if CoolProp fails
             rho_upstream = rho
             mu_upstream = mu
-            
+        
         # A = mdot / (Cd * P1 * choked_factor) * sqrt(Z*R*T)
-        eqA_approx = calculate_choked_flow(fr_samples[i], P_Pa, Cd)
+        eqA_approx = calculate_choked_flow(fr_samples[i], P1_Pa, Cd)
         eqD_approx = np.sqrt(4 * eqA_approx / math.pi) if eqA_approx > 0 else 0
         
         # Calculate Reynolds number – for choked flow use sonic velocity
@@ -785,7 +816,7 @@ elif flow_model == "Compressible - Critical Flow":
             Cd_corrected[i] = Cd
         
         # Critical flow equation with corrected Cd
-        eqA[i] = calculate_choked_flow(fr_samples[i], P_Pa, Cd_corrected[i])
+        eqA[i] = calculate_choked_flow(fr_samples[i], P1_Pa, Cd_corrected[i])
 
 # Calculate equivalent diameter
 eqD = np.sqrt(4 * eqA / math.pi) * 1000  # Convert to mm for better readability
@@ -803,6 +834,14 @@ df = pd.DataFrame({
     "EqArea_Safe (m²)": eqA_safe,
     "EqDiam_Safe (mm)": eqD_safe
 })
+
+# Flow values in user-selected display units for plotting/export
+if fr_type == "Mass Flow":
+    display_flow = fr_samples / (1.0 if fr_unit == "kg/s" else 0.45359237 if fr_unit == "lbm/s" else 0.001)
+else:
+    # Convert mass flow back to volumetric using upstream density
+    vol_flow_si = fr_samples / rho  # m^3/s
+    display_flow = vol_flow_si / (1.0 if fr_unit == "m³/s" else 0.02831685 if fr_unit == "ft³/s" else 0.001 if fr_unit == "L/s" else 0.0000631)
 
 # TAB 2: Results & Visualization (Moved content from old display_tab1 here)
 with main_tabs[1]:
@@ -971,7 +1010,7 @@ with main_tabs[1]:
             fig = px.scatter(
                 x=df["ΔP (Pa)"]/dp_convert,
                 y=display_diam,
-                color=df["Flow Rate"]/flow_convert,
+                color=display_flow,
                 labels={
                     "x": f"ΔP ({dp_unit})",
                     "y": f"ESEOD ({eq_diam_unit})",
@@ -1143,7 +1182,7 @@ with main_tabs[2]:
         st.subheader("Input Summary")
         st.write(f"- **Fluid:** {fluid}")
         st.write(f"- **Temperature:** {T:.2f} K ({T_val} {T_unit})")
-        st.write(f"- **Pressure:** {P_Pa/1000:.2f} kPa ({P_val} {P_unit})")
+        st.write(f"- **Pressure:** {P1_Pa/1000:.2f} kPa ({P_val} {P_unit})")
         
         if use_range:
             st.write(f"- **Flow Rate:** {fr_min}-{fr_max} {unit_label}")
@@ -1446,7 +1485,7 @@ with main_tabs[2]:
                         
                         # Plot Mach vs Flow rate
                         fig = px.scatter(
-                            x=fr_samples/flow_convert,
+                            x=display_flow,
                             y=mach,
                             color=dp_samples/dp_convert,
                             labels={
@@ -1997,7 +2036,7 @@ with col_export2:
                     "Value": [
                         fluid,
                         f"{T_val} {T_unit} ({T:.2f} K)",
-                        f"{P_val} {P_unit} ({P_Pa/1000:.2f} kPa)",
+                        f"{P_val} {P_unit} ({P1_Pa/1000:.2f} kPa)",
                         fr_type,
                         f"{fr_min}-{fr_max} {unit_label}" if use_range else f"{fr_min} {unit_label}",
                         f"{dp_min}-{dp_max} {dp_unit}" if use_dp_range else f"{dp_min} {dp_unit}",
@@ -2040,7 +2079,7 @@ with col_export2:
                         chart_data = pd.DataFrame({
                             f"ΔP ({dp_unit})": df["ΔP (Pa)"]/dp_convert,
                             f"ESEOD ({eq_diam_unit})": display_diam,
-                            f"Flow Rate ({unit_label})": df["Flow Rate"]/flow_convert
+                            f"Flow Rate ({unit_label})": display_flow
                         })
                         chart_data.to_excel(writer, sheet_name='Chart Data', index=False)
                     elif chart_type == "Box Plot":
